@@ -26,12 +26,21 @@ Kubernetes cluster you want InfraHub to monitor.
 
 The agent only ever dials **out** to InfraHub; nothing needs to be exposed
 or opened on this cluster for it to work. Its ServiceAccount is granted
-read-only (get/list/watch) access to pods, pods/log, nodes, namespaces,
-deployments/statefulsets/daemonsets, services, and persistent volume
-claims -- plus read access to pod/node metrics if metrics-server is
-installed. It deliberately has no access to Secrets or ConfigMaps, and
-nothing in the manifest can create, modify, or delete any cluster
-resource.
+read-only (get/list/watch) access to a broad set of resource kinds --
+pods, pods/log, nodes, namespaces, deployments/statefulsets/daemonsets/
+replicasets, jobs/cronjobs, services, persistentvolumeclaims/
+persistentvolumes/storageclasses, ingresses/networkpolicies,
+endpointslices, resourcequotas/limitranges, poddisruptionbudgets, and
+horizontalpodautoscalers -- plus read access to pod/node metrics if
+metrics-server is installed. See `deploy/manifest.yaml`'s own header
+comment for the exact, current RBAC rules (kept accurate there, not
+duplicated here to avoid drift). It deliberately has no access to
+Secrets, ConfigMaps, or any RBAC object, and nothing in the manifest can
+create, modify, or delete any cluster resource.
+
+If you already have an older version of this agent installed, re-run
+`kubectl apply -f manifest.yaml` after an update to pick up any RBAC
+changes -- see the manifest's own "IMPORTANT" note for details.
 
 ## Building your own image
 

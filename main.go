@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,11 +32,13 @@ func main() {
 	if backendURL == "" || token == "" {
 		log.Fatal("INFRAHUB_BACKEND_URL and INFRAHUB_AGENT_TOKEN must both be set")
 	}
+	log.Printf("starting k8s-agent: backend=%s token=provided", backendURL)
 
 	k8s, err := newK8sClient()
 	if err != nil {
 		log.Fatalf("kubernetes client: %v", err)
 	}
+	log.Print("kubernetes client initialized")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -94,6 +97,7 @@ const pingPeriod = 15 * time.Second
 // until stop_stream or the connection closes).
 func runOnce(ctx context.Context, backendURL, token string, k8s *k8sClient) error {
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	log.Printf("connecting to InfraHub at %s", backendURL)
 	conn, _, err := dialer.DialContext(ctx, backendURL, http.Header{"Authorization": {"Bearer " + token}})
 	if err != nil {
 		return err
@@ -166,18 +170,32 @@ func handleCommand(ctx context.Context, conn *websocket.Conn, writeMu *sync.Mute
 	switch cmd.Type {
 	case CmdServerVersion:
 		version, err := k8s.ServerVersion(ctx)
+		if err != nil {
+			log.Printf("server_version query failed: %v", err)
+		} else {
+			log.Printf("server_version: %s", version)
+		}
 		sendResult(conn, writeMu, cmd.ID, ServerVersionResult{Version: version}, err)
 
 	case CmdListPods:
 		pods, err := k8s.ListPods(ctx, cmd.Namespace)
+		if err != nil {
+			log.Printf("list_pods failed (namespace=%q): %v", cmd.Namespace, err)
+		}
 		sendResult(conn, writeMu, cmd.ID, pods, err)
 
 	case CmdListNodes:
 		nodes, err := k8s.ListNodes(ctx)
+		if err != nil {
+			log.Printf("list_nodes failed: %v", err)
+		}
 		sendResult(conn, writeMu, cmd.ID, nodes, err)
 
 	case CmdClusterResourceSummary:
 		summary, err := k8s.ClusterResourceSummary(ctx)
+		if err != nil {
+			log.Printf("cluster_resource_summary failed: %v", err)
+		}
 		sendResult(conn, writeMu, cmd.ID, summary, err)
 
 	case CmdFetchLogsSince:
@@ -186,6 +204,11 @@ func handleCommand(ctx context.Context, conn *websocket.Conn, writeMu *sync.Mute
 			since, _ = time.Parse(time.RFC3339Nano, cmd.Since)
 		}
 		output, err := k8s.FetchLogsSince(ctx, cmd.Namespace, cmd.PodName, since)
+		if err != nil {
+			log.Printf("fetch_logs_since failed for pod %s/%s: %v", cmd.Namespace, cmd.PodName, err)
+		} else {
+			log.Printf("fetch_logs_since: sent %d lines for pod %s/%s", countLines(output), cmd.Namespace, cmd.PodName)
+		}
 		sendResult(conn, writeMu, cmd.ID, map[string]string{"output": output}, err)
 
 	case CmdStreamLogs:
@@ -195,7 +218,10 @@ func handleCommand(ctx context.Context, conn *websocket.Conn, writeMu *sync.Mute
 			activeStreams.Delete(cmd.ID)
 			cancel()
 		}()
+		log.Printf("log stream started for pod %s/%s", cmd.Namespace, cmd.PodName)
+		lines := 0
 		err := k8s.StreamLogs(streamCtx, cmd.Namespace, cmd.PodName, func(line string) {
+			lines++
 			writeMu.Lock()
 			_ = conn.WriteJSON(Message{ID: cmd.ID, Type: MsgLogLine, Line: line})
 			writeMu.Unlock()
@@ -207,13 +233,37 @@ func handleCommand(ctx context.Context, conn *websocket.Conn, writeMu *sync.Mute
 			_ = conn.WriteJSON(Message{ID: cmd.ID, Type: MsgDone})
 		}
 		writeMu.Unlock()
+		if err != nil && streamCtx.Err() == nil {
+			log.Printf("log stream ended for pod %s/%s: forwarded %d lines, error: %v", cmd.Namespace, cmd.PodName, lines, err)
+		} else {
+			log.Printf("log stream ended for pod %s/%s: forwarded %d lines", cmd.Namespace, cmd.PodName, lines)
+		}
 
 	case CmdStopStream:
 		if v, ok := activeStreams.Load(cmd.ID); ok {
 			v.(context.CancelFunc)()
 			activeStreams.Delete(cmd.ID)
+			log.Printf("log stream stopped by request: command %s", cmd.ID)
 		}
+
+	default:
+		// Mirrors docker-agent/main.go's handling: an unrecognized command
+		// means this agent binary predates a backend that's added new
+		// commands. Unlike docker-agent/vm-agent this protocol has no
+		// established "unknown command" error response, so this only logs
+		// locally rather than changing the wire behavior.
+		log.Printf("received unknown command %q -- ignoring", cmd.Type)
 	}
+}
+
+// countLines returns the number of newline-terminated lines in a
+// FetchLogsSince-shaped blob, for a compact "sent N lines" log line --
+// purely for this agent's own stdout, never sent over the wire.
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n")
 }
 
 func sendResult(conn *websocket.Conn, writeMu *sync.Mutex, id string, data any, err error) {
